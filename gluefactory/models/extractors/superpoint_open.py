@@ -89,7 +89,7 @@ class SuperPoint(BaseModel):
         "weights": None,  # local path of pretrained weights
     }
 
-    checkpoint_url = "https://github.com/rpautrat/SuperPoint/raw/master/weights/superpoint_v6_from_tf.pth"  # noqa: E501
+    checkpoint_url = "https://ghfast.top/https://github.com/rpautrat/SuperPoint/raw/master/weights/superpoint_v6_from_tf.pth"  # noqa: E501
 
     def _init(self, conf):
         self.conf = SimpleNamespace(**conf)

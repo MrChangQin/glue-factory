@@ -169,7 +169,7 @@ class SuperPoint(BaseModel):
     }
     required_data_keys = ["image"]
 
-    checkpoint_url = "https://github.com/magicleap/SuperGluePretrainedNetwork/raw/master/models/weights/superpoint_v1.pth"  # noqa: E501
+    checkpoint_url = "https://ghfast.top/https://github.com/magicleap/SuperGluePretrainedNetwork/raw/master/models/weights/superpoint_v1.pth"  # noqa: E501
 
     def _init(self, conf):
         self.relu = nn.ReLU(inplace=True)

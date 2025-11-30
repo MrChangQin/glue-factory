@@ -129,24 +129,24 @@ class HomographyDataset(BaseDataset):
         self.images = {"train": train_images, "val": val_images}
 
     def download_revisitop1m(self):
-        data_dir = DATA_PATH / self.conf.data_dir
-        tmp_dir = data_dir.parent / "revisitop1m_tmp"
-        if tmp_dir.exists():  # The previous download failed.
-            shutil.rmtree(tmp_dir)
-        image_dir = tmp_dir / self.conf.image_dir
+        data_dir = DATA_PATH / self.conf.data_dir # 数据目录
+        tmp_dir = data_dir.parent / "revisitop1m_tmp" # 临时目录
+        if tmp_dir.exists():  # 如果临时目录存在，删除它！！！
+            shutil.rmtree(tmp_dir) # 删除临时目录
+        image_dir = tmp_dir / self.conf.image_dir # revisitop1m_tmp/jpg/
         image_dir.mkdir(exist_ok=True, parents=True)
         num_files = 100
         url_base = "http://ptak.felk.cvut.cz/revisitop/revisitop1m/"
         list_name = "revisitop1m.txt"
         torch.hub.download_url_to_file(url_base + list_name, tmp_dir / list_name)
         for n in tqdm(range(num_files), position=1):
-            tar_name = "revisitop1m.{}.tar.gz".format(n + 1)
+            tar_name = "revisitop1m.{}.tar.gz".format(n + 1) # 文件名，如 revisitop1m.1.tar.gz
             tar_path = image_dir / tar_name
-            torch.hub.download_url_to_file(url_base + "jpg/" + tar_name, tar_path)
-            with tarfile.open(tar_path) as tar:
+            torch.hub.download_url_to_file(url_base + "jpg/" + tar_name, tar_path) # 下载文件
+            with tarfile.open(tar_path) as tar:  # 解压缩文件
                 tar.extractall(path=image_dir)
             tar_path.unlink()
-        shutil.move(tmp_dir, data_dir)
+        shutil.move(tmp_dir, data_dir)  # 重命名目录revisitop1m_tmp 为 revisitop1m
 
     def get_dataset(self, split):
         return _Dataset(self.conf, self.images[split], split)
