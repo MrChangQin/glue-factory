@@ -17,6 +17,7 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
+    "omegaconf",
     "einops",
     "torch>=1.7",
     "torchvision>=0.8",

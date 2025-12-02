@@ -741,3 +741,57 @@ class LightGlue(nn.Module):
 
 
 __main_model__ = LightGlue
+
+# Device: cuda
+# Total parameters: 13,035,893
+# Trainable parameters: 13,035,893
+# Frozen parameters: 0
+# Parameters by top-level module:
+#   transformers         12,439,332
+#   log_assignment       594,441
+#   token_confidence     2,056
+#   posenc               64
+if __name__ == "__main__":
+    """
+    用法示例（在项目根目录运行）：
+      python -m gluefactory.models.matchers.lightglue --device cuda
+    """
+
+    import argparse
+    from omegaconf import OmegaConf
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device", default="cpu", help="cpu or cuda")
+    parser.add_argument(
+        "--conf", default=None, help="optional yaml to override default_conf"
+    )
+    args = parser.parse_args()
+
+    # prepare conf (OmegaConf) and instantiate
+    base_conf = getattr(LightGlue, "default_conf", {})
+    conf = OmegaConf.create(base_conf)
+    if args.conf:
+        conf = OmegaConf.merge(conf, OmegaConf.load(args.conf))
+
+    device = args.device
+    model = LightGlue(conf).to(device)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen_params = total_params - trainable_params
+
+    print(f"Device: {device}")
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    print(f"Frozen parameters: {frozen_params:,}")
+
+    # 可选：按模块打印较大参数
+    from collections import defaultdict
+
+    by_module = defaultdict(int)
+    for name, p in model.named_parameters():
+        mod = name.split(".")[0]
+        by_module[mod] += p.numel()
+    print("Parameters by top-level module:")
+    for m, c in sorted(by_module.items(), key=lambda x: -x[1]):
+        print(f"  {m:<20s} {c:,}")

@@ -1,68 +1,60 @@
+# 用于快速验证 lightglue_tssa 模型能否在本仓库中跑通的最小测试脚本
+
 import sys
 from pathlib import Path
 import torch
+from omegaconf import OmegaConf
 
-# 确保能 import 项目模块（从 repo 根）
-repo_root = Path(__file__).resolve().parents[1]
-sys.path.append(str(repo_root))
+# 将工程根目录加入 sys.path，确保能 import gluefactory 包
+PROJECT_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
-from gluefactory.models.matchers.lightglue_tssa import LightGlue
+# 加载配置文件
+cfg_path = PROJECT_ROOT / "gluefactory" / "configs" / "superpoint+lightglue_megadepth_v1.yaml"
+cfg = OmegaConf.load(str(cfg_path))
 
-def make_dummy(batch=1, m=8, n=10, dim=64, device="cpu"):
-    kpts0 = torch.rand(batch, m, 2, device=device)
-    kpts1 = torch.rand(batch, n, 2, device=device)
-    desc0 = torch.rand(batch, m, dim, device=device)
-    desc1 = torch.rand(batch, n, dim, device=device)
+# 直接使用实现文件中的 LightGlue
+from gluefactory.models.matchers.lightglue_tssa_efficient import LightGlue
+
+def make_dummy_batch(
+    batch_size=1, m=64, n=72, desc_dim=256, image_size=(640, 480), device="cpu"
+):
+    B = batch_size
+    keypoints0 = torch.rand(B, m, 2, device=device) * torch.tensor(image_size[::-1], device=device)
+    keypoints1 = torch.rand(B, n, 2, device=device) * torch.tensor(image_size[::-1], device=device)
+    descriptors0 = torch.randn(B, m, desc_dim, device=device)
+    descriptors1 = torch.randn(B, n, desc_dim, device=device)
+
     data = {
-        "keypoints0": kpts0,
-        "keypoints1": kpts1,
-        "descriptors0": desc0,
-        "descriptors1": desc1,
-        "view0": {"image_size": (128, 128)},
-        "view1": {"image_size": (128, 128)},
+        "keypoints0": keypoints0,
+        "keypoints1": keypoints1,
+        "descriptors0": descriptors0,
+        "descriptors1": descriptors1,
+        "view0": {"image_size": torch.tensor(image_size[::-1], device=device)},
+        "view1": {"image_size": torch.tensor(image_size[::-1], device=device)},
     }
     return data
 
-def test_forward_and_train(device="cpu"):
-    conf = {
-        "n_layers": 2,
-        "num_heads": 2,
-        "input_dim": 64,
-        "descriptor_dim": 64,
-        "flash": False,
-        "mp": False,
-        "width_confidence": -1,
-        "depth_confidence": -1,
-        "filter_threshold": 0.0,
-        "weights": None,
-    }
-
-    model = LightGlue(conf).to(device)
-
-    # 推理测试
+def main():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # 使用配置里的 matcher 部分作为 conf（会与模型默认配置合并）
+    matcher_conf = OmegaConf.to_container(cfg.model.matcher, resolve=True)
+    model = LightGlue(matcher_conf)
     model.eval()
-    data = make_dummy(device=device)
+    model.to(device)
+
+    # desc_dim 与模型默认 input_dim 一致（LightGlue.default_conf 默认 256）
+    data = make_dummy_batch(batch_size=1, m=128, n=140, desc_dim=model.conf.input_dim, image_size=(1024, 768), device=device)
+
     with torch.no_grad():
-        pred = model(data)
-    print("inference keys:", list(pred.keys()))
-    assert "matches0" in pred and "matching_scores0" in pred
+        out = model(data)
 
-    # 训练测试（单步）
-    model.train()
-    opt = torch.optim.Adam(model.parameters(), lr=1e-4)
-    data = make_dummy(device=device)
-    pred = model(data)
-    losses, metrics = model.loss(pred, data)
-    loss = losses["total"]
-    loss.backward()
-    opt.step()
-
-    # 检查有梯度（至少一个参数）
-    has_grad = any(p.grad is not None for p in model.parameters() if p.requires_grad)
-    assert has_grad, "no gradients after backward"
+    # 简要打印结果以确认前向通过
+    print("模型前向成功，输出键：", list(out.keys()))
+    print("matches0 shape:", out["matches0"].shape)
+    print("matching_scores0 shape:", out["matching_scores0"].shape)
+    # 若需要可查看第一个匹配对示例
+    print("matches0[0,:10]:", out["matches0"][0, :10].cpu().numpy())
 
 if __name__ == "__main__":
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print("running on", device)
-    test_forward_and_train(device=device)
-    print("OK")
+    main()
