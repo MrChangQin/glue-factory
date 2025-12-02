@@ -257,6 +257,7 @@ We first pre-train LightGlue on the homography dataset:
 ```bash
 python -m gluefactory.train sp+lg_homography \  # experiment name
     --conf gluefactory/configs/superpoint+lightglue_homography.yaml
+    --distributed # GPUS
 ```
 Feel free to use any other experiment name. By default the checkpoints are written to `outputs/training/`. The default batch size of 128 corresponds to the results reported in the paper and requires 2x 3090 GPUs with 24GB of VRAM each as well as PyTorch >= 2.0 (FlashAttention).
 Configurations are managed by [OmegaConf](https://omegaconf.readthedocs.io/) so any entry can be overridden from the command line.

@@ -1,5 +1,5 @@
 #!/bin/bash
-TARGET_DIR="./data/res/jpg"
+TARGET_DIR="./data/revisitop1m/jpg"
 
 cd "$TARGET_DIR" || exit 1
 

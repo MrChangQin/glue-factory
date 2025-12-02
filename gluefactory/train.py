@@ -3,6 +3,9 @@ A generic training script that works with any model and dataset.
 
 Author: Paul-Edouard Sarlin (skydes)
 """
+import os
+os.environ['NO_ALBUMENTATIONS_UPDATE'] = '1'
+
 
 import argparse
 import copy
