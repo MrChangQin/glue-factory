@@ -8,12 +8,9 @@ import torch.nn.functional as F
 from omegaconf import OmegaConf
 from torch import nn
 
-from ...settings import DATA_PATH   # 数据集位置，模型自动下载
+from ...settings import DATA_PATH
 from ..utils.losses import NLLLoss
 from ..utils.metrics import matcher_metrics
-
-# TODO: 安装mamba_ssm
-from mamba_ssm import Mamba # pip install mamba-ssm
 
 FLASH_AVAILABLE = hasattr(F, "scaled_dot_product_attention")
 
@@ -27,7 +24,6 @@ AMP_CUSTOM_FWD_F32 = (
 )
 
 
-# normalize_keypoints 函数的作用是对输入张量中的每个元素进行归一化处理，使其位于[-1, 1]范围内。
 @AMP_CUSTOM_FWD_F32
 def normalize_keypoints(
     kpts: torch.Tensor, size: Optional[torch.Tensor] = None
@@ -43,19 +39,16 @@ def normalize_keypoints(
     return kpts
 
 
-# rotate_half 函数的作用是对输入张量的最后维度进行分组，并对每组两个元素执行90度旋转操作。
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x = x.unflatten(-1, (-1, 2))
     x1, x2 = x.unbind(dim=-1)
     return torch.stack((-x2, x1), dim=-1).flatten(start_dim=-2)
 
 
-# apply_cached_rotary_emb 函数的作用是，将输入张量中的每个元素与旋转向量进行逐元素乘法，并返回结果张量。
 def apply_cached_rotary_emb(freqs: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     return (t * freqs[0]) + (rotate_half(t) * freqs[1])
 
 
-# LearnableFourierPositionalEncoding 函数的作用是，根据给定的参数M和维度dim，生成一个包含M个元素，每个元素为维度dim的旋转向量。
 class LearnableFourierPositionalEncoding(nn.Module):
     def __init__(self, M: int, dim: int, F_dim: int = None, gamma: float = 1.0) -> None:
         super().__init__()
@@ -72,7 +65,6 @@ class LearnableFourierPositionalEncoding(nn.Module):
         return emb.repeat_interleave(2, dim=-1)
 
 
-# TokenConfidence 函数的作用是，根据给定的描述向量，生成两个描述向量的置信度向量。
 class TokenConfidence(nn.Module):
     def __init__(self, dim: int) -> None:
         super().__init__()
@@ -102,10 +94,11 @@ class TokenConfidence(nn.Module):
         ) / 2.0
 
 
-# Attention 类实现了注意力机制，支持多种实现方式，包括FlashAttention优化版本和标准实现。
-# 这个Attention模块是构建SelfBlock和CrossBlock的基础组件，在Transformer架构中负责捕捉特征间的关系，
-# 特别针对关键点匹配任务进行了优化。通过支持FlashAttention，显著提升了大规模注意力计算的效率。
-# TODO: 尝试使用FlashAttention优化版本？
+# Global container for MoH-inspired load-balancing losses collected during forward.
+# This should be cleared after each backward pass to avoid multiple backward through the same graph.
+MOH_LOAD_BALANCING_LOSSES: List[torch.Tensor] = []
+
+
 class Attention(nn.Module):
     def __init__(self, allow_flash: bool) -> None:
         super().__init__()
@@ -140,11 +133,16 @@ class Attention(nn.Module):
             return torch.einsum("...ij,...jd->...id", attn, v)
 
 
-# SelfBlock 类实现了自注意力机制，用于处理输入特征。
-# 这个模块的实现主要依赖于Attention类，以及一些线性变换和归一化层。
-# 通过自注意力机制，SelfBlock能够捕获输入特征之间的依赖关系，并生成新的特征表示。
-# 这个模块的实现也支持FlashAttention优化，以提升效率。
-class SelfBlock(nn.Module):
+class SelfBlockMoH(nn.Module):
+    """
+    MoH-inspired SelfBlock: 保留原 LightGlue 的 qkv/rotary/ffn 接口，
+    并在多头级别引入 token-wise soft-gating（路由）机制。
+
+    说明：这是一个工程友好的 MoH 近似实现，避免外部依赖。
+    它会在 forward 时将每个 token 对所有 heads 计算一个门控权重，
+    并据此缩放各头的输出；同时收集 load-balancing 损失到全局变量。
+    """
+
     def __init__(
         self, embed_dim: int, num_heads: int, flash: bool = False, bias: bool = True
     ) -> None:
@@ -153,9 +151,18 @@ class SelfBlock(nn.Module):
         self.num_heads = num_heads
         assert self.embed_dim % num_heads == 0
         self.head_dim = self.embed_dim // num_heads
+        # use same qkv projection for compatibility
         self.Wqkv = nn.Linear(embed_dim, 3 * embed_dim, bias=bias)
         self.inner_attn = Attention(flash)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        # small router: maps token embedding -> num_heads logits
+        # we compute gates from the input x (per token)
+        self.router = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_dim // 2, num_heads),
+        )
+        self.register_buffer("eps", torch.tensor(1e-6))
         self.ffn = nn.Sequential(
             nn.Linear(2 * embed_dim, 2 * embed_dim),
             nn.LayerNorm(2 * embed_dim, elementwise_affine=True),
@@ -169,20 +176,47 @@ class SelfBlock(nn.Module):
         encoding: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """
+        x: (B, N, C)
+        encoding: rotary freqs shaped for apply_cached_rotary_emb
+        mask: Optional square mask or per-token mask (assumed square for compatibility)
+        """
+        B, N, C = x.shape
         qkv = self.Wqkv(x)
+        # reshape to (B, 3, heads, N, head_dim)
         qkv = qkv.unflatten(-1, (self.num_heads, -1, 3)).transpose(1, 2)
-        q, k, v = qkv[..., 0], qkv[..., 1], qkv[..., 2]
+        q, k, v = qkv[..., 0], qkv[..., 1], qkv[..., 2]  # shapes: B, heads, N, head_dim
+
+        # apply rotary to q and k as in original LightGlue (encoding provides freq pairs)
         q = apply_cached_rotary_emb(encoding, q)
         k = apply_cached_rotary_emb(encoding, k)
-        context = self.inner_attn(q, k, v, mask=mask)
-        message = self.out_proj(context.transpose(1, 2).flatten(start_dim=-2))
+
+        # compute per-token gates (soft routing): shape (B, N, heads)
+        # router consumes x (B,N,C) and outputs logits
+        gates_logits = self.router(x)  # (B, N, heads)
+        gates = F.softmax(gates_logits, dim=-1)  # soft allocation across heads for each token
+
+        # call attention core: expects q,k,v shaped (B, heads, N, head_dim)
+        context = self.inner_attn(q, k, v, mask=mask)  # (B, heads, N, head_dim)
+
+        # apply gates to context: need shape (B, heads, N, 1)
+        gates_for_context = gates.permute(0, 2, 1).unsqueeze(-1)  # (B, heads, N, 1)
+        gated_context = context * gates_for_context
+
+        # collect a simple load-balancing loss: encourage equal mean usage across heads
+        # head_usage: mean over batch and tokens -> (heads,)
+        head_usage = gates.mean(dim=(0, 1))  # (heads,)
+        target = gates.new_full(head_usage.shape, 1.0 / self.num_heads)
+        lb_loss = (head_usage - target).pow(2).mean()
+        # append to global list (caller/training loop should consume and clear)
+        MOH_LOAD_BALANCING_LOSSES.append(lb_loss)
+
+        # merge heads back to (B, N, C)
+        message = gated_context.transpose(1, 2).flatten(start_dim=-2)  # (B, N, C)
+        message = self.out_proj(message)
         return x + self.ffn(torch.cat([x, message], -1))
 
 
-# CrossBlock 类实现了跨模态注意力机制，用于处理输入特征和参考特征。
-# 这个模块的实现主要依赖于Attention类，以及一些线性变换和归一化层。
-# 通过跨模态注意力机制，CrossBlock能够捕获输入特征和参考特征之间的依赖关系，并生成新的特征表示。
-# 这个模块的实现也支持FlashAttention优化，以提升效率。
 class CrossBlock(nn.Module):
     def __init__(
         self, embed_dim: int, num_heads: int, flash: bool = False, bias: bool = True
@@ -241,64 +275,11 @@ class CrossBlock(nn.Module):
         return x0, x1
 
 
-# TODO: MambaCrossBlock设计？
-class MambaCrossBlock(nn.Module):
-    def __init__(self, embed_dim: int):
-        super().__init__()
-        self.dim = embed_dim
-
-        # projection
-        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=True)
-        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=True)
-        self.merge_proj = nn.Linear(embed_dim * 2, embed_dim, bias=True)
-
-        # Mamba blocks
-        self.mamba0 = Mamba(embed_dim)
-        self.mamba1 = Mamba(embed_dim)
-
-        # FFN (保持 LightGlue 原结构)
-        self.ffn = nn.Sequential(
-            nn.Linear(2 * embed_dim, 2 * embed_dim),
-            nn.LayerNorm(2 * embed_dim),
-            nn.GELU(),
-            nn.Linear(2 * embed_dim, embed_dim),
-        )
-
-    def forward(self, x0: torch.Tensor, x1: torch.Tensor, mask=None):
-        """
-        x0: [B, N, C]
-        x1: [B, M, C]
-        """
-
-        # 1) 基础投影（用于 gating）
-        q0 = self.q_proj(x0)
-        q1 = self.q_proj(x1)
-        k0 = self.k_proj(x0)
-        k1 = self.k_proj(x1)
-
-        # 2) Mamba 双向交互
-        # Mamba supports external input: Mamba(x, external_input)
-        x0_state = self.mamba0(q0, external_input=k1)
-        x1_state = self.mamba1(q1, external_input=k0)
-
-        # 3) Residual + FFN（保持兼容 LightGlue）
-        x0_out = x0 + self.ffn(torch.cat([x0, x0_state], dim=-1))
-        x1_out = x1 + self.ffn(torch.cat([x1, x1_state], dim=-1))
-
-        return x0_out, x1_out
-
-
-# TransformerLayer 类实现了Transformer结构，用于处理输入特征和参考特征。
-# 这个模块的实现主要依赖于SelfBlock和CrossBlock类，以及一些线性变换和归一化层。
-# 通过Transformer结构，TransformerLayer能够捕获输入特征和参考特征之间的依赖关系，并生成新的特征表示。
-# 这个模块的实现也支持FlashAttention优化，以提升效率。
-# TODO: 替换CrossBlock为MambaCrossBlock 
 class TransformerLayer(nn.Module):
     def __init__(self, *args, **kwargs):
         super().__init__()
-        self.self_attn = SelfBlock(*args, **kwargs)
-        # self.cross_attn = CrossBlock(*args, **kwargs)
-        self.cross_attn = MambaCrossBlock(args[0])
+        self.self_attn = SelfBlockMoH(*args, **kwargs)
+        self.cross_attn = CrossBlock(*args, **kwargs)
 
     def forward(
         self,
@@ -323,11 +304,9 @@ class TransformerLayer(nn.Module):
         mask1 = mask1 & mask1.transpose(-1, -2)
         desc0 = self.self_attn(desc0, encoding0, mask0)
         desc1 = self.self_attn(desc1, encoding1, mask1)
-        # return self.cross_attn(desc0, desc1, mask)
-        return self.cross_attn(desc0, desc1)  # mamba不使用attention mask
+        return self.cross_attn(desc0, desc1, mask)
 
 
-# sigmoid_log_double_softmax 函数实现了一个用于创建匹配概率矩阵的函数。
 def sigmoid_log_double_softmax(
     sim: torch.Tensor, z0: torch.Tensor, z1: torch.Tensor
 ) -> torch.Tensor:
@@ -343,7 +322,6 @@ def sigmoid_log_double_softmax(
     return scores
 
 
-# MatchAssignment 类实现了Matchability结构，用于处理输入特征和参考特征。
 class MatchAssignment(nn.Module):
     def __init__(self, dim: int) -> None:
         super().__init__()
@@ -366,7 +344,6 @@ class MatchAssignment(nn.Module):
         return torch.sigmoid(self.matchability(desc)).squeeze(-1)
 
 
-# filter_matches 函数实现一个用于从匹配概率矩阵中筛选匹配的函数。
 def filter_matches(scores: torch.Tensor, th: float):
     """obtain matches from a log assignment matrix [Bx M+1 x N+1]"""
     max0, max1 = scores[:, :-1, :-1].max(2), scores[:, :-1, :-1].max(1)
@@ -386,8 +363,6 @@ def filter_matches(scores: torch.Tensor, th: float):
     return m0, m1, mscores0, mscores1
 
 
-# ·LightGlue 类实现了LightGlue结构，用于处理输入特征和参考特征。
-# 这个模块的实现主要依赖于TransformerLayer类，以及一些线性变换和归一化层。
 class LightGlue(nn.Module):
     default_conf = {
         "name": "lightglue",  # just for interfacing
@@ -698,6 +673,16 @@ class LightGlue(nn.Module):
         if self.training:
             losses["total"] = losses["total"] + losses["confidence"]
 
+        # add MoH load-balancing loss during training if any
+        if self.training and len(MOH_LOAD_BALANCING_LOSSES) > 0:
+            # simple sum of collected losses (caller can weight this)
+            lb_sum = torch.stack(MOH_LOAD_BALANCING_LOSSES).sum()
+            losses["moh_load_balancing"] = lb_sum
+            # clear global buffer for next iteration
+            MOH_LOAD_BALANCING_LOSSES.clear()
+            # default weight 0.05 (you can change when calling optimizer)
+            losses["total"] = losses["total"] + 0.05 * lb_sum
+
         if not self.training:
             # add metrics
             metrics = matcher_metrics(pred, data)
@@ -709,10 +694,12 @@ class LightGlue(nn.Module):
 __main_model__ = LightGlue
 
 
+# Total parameters: ~ (will differ due to router)
+
 if __name__ == "__main__":
     """
     用法示例（在项目根目录运行）：
-      python -m gluefactory.models.matchers.lightglue --device cuda
+      python -m gluefactory.models.matchers.lightglue_moha --device cuda
     """
 
     import argparse
@@ -753,4 +740,3 @@ if __name__ == "__main__":
     print("Parameters by top-level module:")
     for m, c in sorted(by_module.items(), key=lambda x: -x[1]):
         print(f"  {m:<20s} {c:,}")
-

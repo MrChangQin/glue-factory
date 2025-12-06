@@ -339,7 +339,7 @@ class LightGlue(nn.Module):
     required_data_keys = ["image0", "image1"]
 
     version = "v0.1_arxiv"
-    url = "https://github.com/cvg/LightGlue/releases/download/{}/{}_lightglue.pth"
+    url = "https://ghfast.top/https://github.com/cvg/LightGlue/releases/download/{}/{}_lightglue.pth"
 
     features = {
         "superpoint": {

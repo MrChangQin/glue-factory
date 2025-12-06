@@ -334,7 +334,7 @@ class LightGlue(nn.Module):
 
     required_data_keys = ["keypoints0", "keypoints1", "descriptors0", "descriptors1"]
 
-    url = "https://github.com/cvg/LightGlue/releases/download/{}/{}_lightglue.pth"
+    url = "https://ghfast.top/https://github.com/cvg/LightGlue/releases/download/{}/{}_lightglue.pth"
 
     def __init__(self, conf) -> None:
         super().__init__()

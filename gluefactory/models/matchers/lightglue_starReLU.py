@@ -8,12 +8,9 @@ import torch.nn.functional as F
 from omegaconf import OmegaConf
 from torch import nn
 
-from ...settings import DATA_PATH   # 数据集位置，模型自动下载
+from ...settings import DATA_PATH
 from ..utils.losses import NLLLoss
 from ..utils.metrics import matcher_metrics
-
-# TODO: 安装mamba_ssm
-from mamba_ssm import Mamba # pip install mamba-ssm
 
 FLASH_AVAILABLE = hasattr(F, "scaled_dot_product_attention")
 
@@ -27,7 +24,6 @@ AMP_CUSTOM_FWD_F32 = (
 )
 
 
-# normalize_keypoints 函数的作用是对输入张量中的每个元素进行归一化处理，使其位于[-1, 1]范围内。
 @AMP_CUSTOM_FWD_F32
 def normalize_keypoints(
     kpts: torch.Tensor, size: Optional[torch.Tensor] = None
@@ -43,19 +39,27 @@ def normalize_keypoints(
     return kpts
 
 
-# rotate_half 函数的作用是对输入张量的最后维度进行分组，并对每组两个元素执行90度旋转操作。
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x = x.unflatten(-1, (-1, 2))
     x1, x2 = x.unbind(dim=-1)
     return torch.stack((-x2, x1), dim=-1).flatten(start_dim=-2)
 
 
-# apply_cached_rotary_emb 函数的作用是，将输入张量中的每个元素与旋转向量进行逐元素乘法，并返回结果张量。
 def apply_cached_rotary_emb(freqs: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     return (t * freqs[0]) + (rotate_half(t) * freqs[1])
 
 
-# LearnableFourierPositionalEncoding 函数的作用是，根据给定的参数M和维度dim，生成一个包含M个元素，每个元素为维度dim的旋转向量。
+class StarReLU(nn.Module):
+    def __init__(self, scale_value=1.0, bias_value=0.0, inplace=False):
+        super().__init__()
+        self.relu = nn.ReLU(inplace=inplace)
+        self.scale = nn.Parameter(torch.tensor(scale_value, dtype=torch.float32))
+        self.bias = nn.Parameter(torch.tensor(bias_value, dtype=torch.float32))
+
+    def forward(self, x):
+        return self.scale * (self.relu(x) ** 2) + self.bias
+
+
 class LearnableFourierPositionalEncoding(nn.Module):
     def __init__(self, M: int, dim: int, F_dim: int = None, gamma: float = 1.0) -> None:
         super().__init__()
@@ -69,10 +73,9 @@ class LearnableFourierPositionalEncoding(nn.Module):
         projected = self.Wr(x)
         cosines, sines = torch.cos(projected), torch.sin(projected)
         emb = torch.stack([cosines, sines], 0).unsqueeze(-3)
-        return emb.repeat_interleave(2, dim=-1)
+        return emb.repeat_interleave(2, dim=-1) 
+    
 
-
-# TokenConfidence 函数的作用是，根据给定的描述向量，生成两个描述向量的置信度向量。
 class TokenConfidence(nn.Module):
     def __init__(self, dim: int) -> None:
         super().__init__()
@@ -102,10 +105,6 @@ class TokenConfidence(nn.Module):
         ) / 2.0
 
 
-# Attention 类实现了注意力机制，支持多种实现方式，包括FlashAttention优化版本和标准实现。
-# 这个Attention模块是构建SelfBlock和CrossBlock的基础组件，在Transformer架构中负责捕捉特征间的关系，
-# 特别针对关键点匹配任务进行了优化。通过支持FlashAttention，显著提升了大规模注意力计算的效率。
-# TODO: 尝试使用FlashAttention优化版本？
 class Attention(nn.Module):
     def __init__(self, allow_flash: bool) -> None:
         super().__init__()
@@ -140,10 +139,6 @@ class Attention(nn.Module):
             return torch.einsum("...ij,...jd->...id", attn, v)
 
 
-# SelfBlock 类实现了自注意力机制，用于处理输入特征。
-# 这个模块的实现主要依赖于Attention类，以及一些线性变换和归一化层。
-# 通过自注意力机制，SelfBlock能够捕获输入特征之间的依赖关系，并生成新的特征表示。
-# 这个模块的实现也支持FlashAttention优化，以提升效率。
 class SelfBlock(nn.Module):
     def __init__(
         self, embed_dim: int, num_heads: int, flash: bool = False, bias: bool = True
@@ -159,7 +154,8 @@ class SelfBlock(nn.Module):
         self.ffn = nn.Sequential(
             nn.Linear(2 * embed_dim, 2 * embed_dim),
             nn.LayerNorm(2 * embed_dim, elementwise_affine=True),
-            nn.GELU(),
+            # nn.GELU(),
+            StarReLU(),
             nn.Linear(2 * embed_dim, embed_dim),
         )
 
@@ -179,10 +175,6 @@ class SelfBlock(nn.Module):
         return x + self.ffn(torch.cat([x, message], -1))
 
 
-# CrossBlock 类实现了跨模态注意力机制，用于处理输入特征和参考特征。
-# 这个模块的实现主要依赖于Attention类，以及一些线性变换和归一化层。
-# 通过跨模态注意力机制，CrossBlock能够捕获输入特征和参考特征之间的依赖关系，并生成新的特征表示。
-# 这个模块的实现也支持FlashAttention优化，以提升效率。
 class CrossBlock(nn.Module):
     def __init__(
         self, embed_dim: int, num_heads: int, flash: bool = False, bias: bool = True
@@ -198,7 +190,8 @@ class CrossBlock(nn.Module):
         self.ffn = nn.Sequential(
             nn.Linear(2 * embed_dim, 2 * embed_dim),
             nn.LayerNorm(2 * embed_dim, elementwise_affine=True),
-            nn.GELU(),
+            # nn.GELU(),
+            StarReLU(),
             nn.Linear(2 * embed_dim, embed_dim),
         )
         if flash and FLASH_AVAILABLE:
@@ -241,64 +234,11 @@ class CrossBlock(nn.Module):
         return x0, x1
 
 
-# TODO: MambaCrossBlock设计？
-class MambaCrossBlock(nn.Module):
-    def __init__(self, embed_dim: int):
-        super().__init__()
-        self.dim = embed_dim
-
-        # projection
-        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=True)
-        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=True)
-        self.merge_proj = nn.Linear(embed_dim * 2, embed_dim, bias=True)
-
-        # Mamba blocks
-        self.mamba0 = Mamba(embed_dim)
-        self.mamba1 = Mamba(embed_dim)
-
-        # FFN (保持 LightGlue 原结构)
-        self.ffn = nn.Sequential(
-            nn.Linear(2 * embed_dim, 2 * embed_dim),
-            nn.LayerNorm(2 * embed_dim),
-            nn.GELU(),
-            nn.Linear(2 * embed_dim, embed_dim),
-        )
-
-    def forward(self, x0: torch.Tensor, x1: torch.Tensor, mask=None):
-        """
-        x0: [B, N, C]
-        x1: [B, M, C]
-        """
-
-        # 1) 基础投影（用于 gating）
-        q0 = self.q_proj(x0)
-        q1 = self.q_proj(x1)
-        k0 = self.k_proj(x0)
-        k1 = self.k_proj(x1)
-
-        # 2) Mamba 双向交互
-        # Mamba supports external input: Mamba(x, external_input)
-        x0_state = self.mamba0(q0, external_input=k1)
-        x1_state = self.mamba1(q1, external_input=k0)
-
-        # 3) Residual + FFN（保持兼容 LightGlue）
-        x0_out = x0 + self.ffn(torch.cat([x0, x0_state], dim=-1))
-        x1_out = x1 + self.ffn(torch.cat([x1, x1_state], dim=-1))
-
-        return x0_out, x1_out
-
-
-# TransformerLayer 类实现了Transformer结构，用于处理输入特征和参考特征。
-# 这个模块的实现主要依赖于SelfBlock和CrossBlock类，以及一些线性变换和归一化层。
-# 通过Transformer结构，TransformerLayer能够捕获输入特征和参考特征之间的依赖关系，并生成新的特征表示。
-# 这个模块的实现也支持FlashAttention优化，以提升效率。
-# TODO: 替换CrossBlock为MambaCrossBlock 
 class TransformerLayer(nn.Module):
     def __init__(self, *args, **kwargs):
         super().__init__()
         self.self_attn = SelfBlock(*args, **kwargs)
-        # self.cross_attn = CrossBlock(*args, **kwargs)
-        self.cross_attn = MambaCrossBlock(args[0])
+        self.cross_attn = CrossBlock(*args, **kwargs)
 
     def forward(
         self,
@@ -323,11 +263,9 @@ class TransformerLayer(nn.Module):
         mask1 = mask1 & mask1.transpose(-1, -2)
         desc0 = self.self_attn(desc0, encoding0, mask0)
         desc1 = self.self_attn(desc1, encoding1, mask1)
-        # return self.cross_attn(desc0, desc1, mask)
-        return self.cross_attn(desc0, desc1)  # mamba不使用attention mask
+        return self.cross_attn(desc0, desc1, mask)
 
 
-# sigmoid_log_double_softmax 函数实现了一个用于创建匹配概率矩阵的函数。
 def sigmoid_log_double_softmax(
     sim: torch.Tensor, z0: torch.Tensor, z1: torch.Tensor
 ) -> torch.Tensor:
@@ -343,7 +281,6 @@ def sigmoid_log_double_softmax(
     return scores
 
 
-# MatchAssignment 类实现了Matchability结构，用于处理输入特征和参考特征。
 class MatchAssignment(nn.Module):
     def __init__(self, dim: int) -> None:
         super().__init__()
@@ -366,7 +303,6 @@ class MatchAssignment(nn.Module):
         return torch.sigmoid(self.matchability(desc)).squeeze(-1)
 
 
-# filter_matches 函数实现一个用于从匹配概率矩阵中筛选匹配的函数。
 def filter_matches(scores: torch.Tensor, th: float):
     """obtain matches from a log assignment matrix [Bx M+1 x N+1]"""
     max0, max1 = scores[:, :-1, :-1].max(2), scores[:, :-1, :-1].max(1)
@@ -386,8 +322,6 @@ def filter_matches(scores: torch.Tensor, th: float):
     return m0, m1, mscores0, mscores1
 
 
-# ·LightGlue 类实现了LightGlue结构，用于处理输入特征和参考特征。
-# 这个模块的实现主要依赖于TransformerLayer类，以及一些线性变换和归一化层。
 class LightGlue(nn.Module):
     default_conf = {
         "name": "lightglue",  # just for interfacing
@@ -709,6 +643,15 @@ class LightGlue(nn.Module):
 __main_model__ = LightGlue
 
 
+# Total parameters: 11,851,601
+# Trainable parameters: 11,851,601
+# Frozen parameters: 0
+# Parameters by top-level module:
+#   transformers         11,255,040
+#   log_assignment       594,441
+#   token_confidence     2,056
+#   posenc               64
+
 if __name__ == "__main__":
     """
     用法示例（在项目根目录运行）：
@@ -753,4 +696,3 @@ if __name__ == "__main__":
     print("Parameters by top-level module:")
     for m, c in sorted(by_module.items(), key=lambda x: -x[1]):
         print(f"  {m:<20s} {c:,}")
-
