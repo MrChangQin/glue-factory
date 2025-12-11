@@ -178,7 +178,7 @@ Running the evaluation commands automatically downloads the dataset, which takes
 
 To evaluate the pre-trained SuperPoint+LightGlue model on Scannet-1500, run:
 ```bash
-python -m gluefactory.eval.scannet1500 --conf superpoint+lightglue-official
+python -m gluefactory.eval.scannet1500 --conf superpoint+lightglue-official --overwrite
 # or the adaptive variant
 python -m gluefactory.eval.scannet1500 --conf superpoint+lightglue-official \
     model.matcher.{depth_confidence=0.95,width_confidence=0.95}
@@ -283,6 +283,7 @@ python -m gluefactory.scripts.export_megadepth --method sp --num_workers 8
 # run training with cached features
 python -m gluefactory.train sp+lg_megadepth \
     --conf gluefactory/configs/superpoint+lightglue_megadepth.yaml \
+    --distributed
     train.load_experiment=sp+lg_homography \
     data.load_features.do=True
 ```
