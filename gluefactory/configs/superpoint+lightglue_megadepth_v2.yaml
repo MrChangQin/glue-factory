@@ -30,7 +30,7 @@ model:
         nms_radius: 3
         trainable: False
     matcher:
-        name: matchers.lightglue_tssa
+        name: matchers.lightglue_tssa+efficient
         filter_threshold: 0.1
         flash: false
         checkpointed: true
